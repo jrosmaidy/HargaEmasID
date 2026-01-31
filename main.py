@@ -82,8 +82,8 @@ def rupiah(n: int) -> str:
 
 async def fetch_harga_emas_org_spot_per_gram(client: httpx.AsyncClient) -> Optional[int]:
     """
-    Extracts the spot-like 'Rp.../g' number from harga-emas.org.
-    Uses page text (safer than raw HTML), plus robust fallbacks.
+    Extract the big spot-like number from harga-emas.org.
+    Tries visible text first, then raw HTML, and supports multiple unit formats.
     """
     url = "https://harga-emas.org/"
     headers = {
@@ -91,31 +91,40 @@ async def fetch_harga_emas_org_spot_per_gram(client: httpx.AsyncClient) -> Optio
                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://harga-emas.org/",
+
     }
+
+    patterns = [
+        r"Rp\s*[\d\.\,]+\s*/\s*g\b",
+        r"Rp\s*[\d\.\,]+\s*/\s*gr\b",
+        r"Rp\s*[\d\.\,]+\s*/\s*gram\b",
+        r"Rp\s*[\d\.\,]+\s*per\s*gram\b",
+    ]
 
     try:
         r = await client.get(url, headers=headers, timeout=20)
         r.raise_for_status()
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(" ", strip=True)
 
-        # Primary: Rp.../g (what you showed in screenshot)
-        m = re.search(r"Rp\s*[\d\.\,]+\s*/\s*g\b", text, flags=re.IGNORECASE)
-        if m:
-            return clean_int_from_text(m.group(0))
-
-        # Fallback 1: sometimes it appears without spaces
-        m = re.search(r"Rp[\d\.\,]+/g\b", text, flags=re.IGNORECASE)
-        if m:
-            return clean_int_from_text(m.group(0))
-
-        # Fallback 2: occasionally it's displayed as "... per gram"
-        m = re.search(r"Rp\s*[\d\.\,]+.{0,10}\bper\s*gram\b", text, flags=re.IGNORECASE)
-        if m:
-            # extract first Rp number in that match
-            m2 = re.search(r"Rp\s*[\d\.\,]+", m.group(0), flags=re.IGNORECASE)
-            return clean_int_from_text(m2.group(0)) if m2 else None
+        # Try visible text first, then raw HTML
+        for hay in (text, html):
+            for p in patterns:
+                m = re.search(p, hay, flags=re.IGNORECASE)
+                if m:
+                    return clean_int_from_text(m.group(0))
+        # Diagnostics: show whether the server response even contains "/g" or "per gram"
+        if "/g" not in html.lower() and "per gram" not in html.lower() and "/gr" not in html.lower():
+            print("DEBUG harga-emas: no /g text in response (likely JS-rendered or different markup).")
+        else:
+            # show a small snippet around "/g" if present
+            idx = html.lower().find("/g")
+            if idx != -1:
+                snippet = html[max(0, idx-120): idx+120]
+                print("DEBUG harga-emas snippet around /g:", snippet.replace("\n", " ")[:240])
 
         return None
 
@@ -177,7 +186,6 @@ def xau_usd_oz_to_idr_per_gram(xau_usd_per_oz: float, usd_idr: float) -> int:
 # AGGREGATION
 # =========================
 def within_pct(a: int, b: int, pct: float) -> bool:
-    # pct = 0.02 means 2%
     if a <= 0 or b <= 0:
         return False
     return abs(a - b) / float(b) <= pct
@@ -207,14 +215,21 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
                 notes.append("Spot disabled (no API keys)")
 
         # --- Harga-Emas.org (/g spot-like) ---
-        he_spot = await fetch_harga_emas_org_spot_per_gram(client)
-        if he_spot:
-            if spot_idr_g and not within_pct(he_spot, spot_idr_g, 0.02):
-                notes.append("Harga-Emas ignored (outlier vs spot)")
+        he = await fetch_harga_emas_org_spot_per_gram(client)
+        print("DEBUG harga-emas /g parsed:", he)
+
+        if he:
+            if spot_idr_g:
+                diff_pct = (he - spot_idr_g) / spot_idr_g * 100
+                print(f"DEBUG diff_pct Harga-Emas vs Spot: {diff_pct:.3f}%")
+
+            if spot_idr_g and not within_pct(he, spot_idr_g, 0.03):
+                notes.append("Harga-Emas ignored (wrong field / outlier)")
             else:
-                prices["Harga-Emas.org (/g)"] = he_spot
+                prices["Harga-Emas.org (/g)"] = he
         else:
             notes.append("Harga-Emas unavailable")
+
 
     cache_set("gold_prices", (prices, notes))
     return prices, notes
@@ -358,5 +373,6 @@ async def receive_webhook(request: Request):
         print("Reply send error:", repr(e))
 
     return JSONResponse({"ok": True})
+
 
 
