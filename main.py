@@ -83,37 +83,46 @@ def rupiah(n: int) -> str:
 async def fetch_harga_emas_org_spot_per_gram(client: httpx.AsyncClient) -> Optional[int]:
     """
     Extracts the spot-like 'Rp.../g' number from harga-emas.org.
-    Avoids accidentally grabbing LM Antam/Pegadaian table prices.
+    Uses page text (safer than raw HTML), plus robust fallbacks.
     """
     url = "https://harga-emas.org/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
     try:
         r = await client.get(url, headers=headers, timeout=20)
         r.raise_for_status()
 
-        # Work on raw text too, because the '/g' is often plain text near the chart.
-        html = r.text
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
 
-        # Look for patterns like: Rp2.891.011/g  OR  Rp 2.891.011 / g
-        m = re.search(r"Rp\s*[\d\.\,]+\s*/\s*g", html, flags=re.IGNORECASE)
-        if not m:
-            # fallback: sometimes it's encoded without spaces like Rp2.891.011/g
-            m = re.search(r"Rp[\d\.\,]+/g", html, flags=re.IGNORECASE)
+        # Primary: Rp.../g (what you showed in screenshot)
+        m = re.search(r"Rp\s*[\d\.\,]+\s*/\s*g\b", text, flags=re.IGNORECASE)
+        if m:
+            return clean_int_from_text(m.group(0))
 
-        if not m:
-            return None
+        # Fallback 1: sometimes it appears without spaces
+        m = re.search(r"Rp[\d\.\,]+/g\b", text, flags=re.IGNORECASE)
+        if m:
+            return clean_int_from_text(m.group(0))
 
-        price_text = m.group(0)
-        return clean_int_from_text(price_text)
+        # Fallback 2: occasionally it's displayed as "... per gram"
+        m = re.search(r"Rp\s*[\d\.\,]+.{0,10}\bper\s*gram\b", text, flags=re.IGNORECASE)
+        if m:
+            # extract first Rp number in that match
+            m2 = re.search(r"Rp\s*[\d\.\,]+", m.group(0), flags=re.IGNORECASE)
+            return clean_int_from_text(m2.group(0)) if m2 else None
+
+        return None
 
     except Exception as e:
         print("fetch_harga_emas_org_spot_per_gram error:", repr(e))
         return None
+
 
 
 async def fetch_spot_xau_usd_per_oz(client: httpx.AsyncClient) -> Optional[float]:
@@ -167,6 +176,13 @@ def xau_usd_oz_to_idr_per_gram(xau_usd_per_oz: float, usd_idr: float) -> int:
 # =========================
 # AGGREGATION
 # =========================
+def within_pct(a: int, b: int, pct: float) -> bool:
+    # pct = 0.02 means 2%
+    if a <= 0 or b <= 0:
+        return False
+    return abs(a - b) / float(b) <= pct
+
+
 async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
     cached = cache_get("gold_prices")
     if cached:
@@ -176,25 +192,33 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
     notes: List[str] = []
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        he = await fetch_harga_emas_org(client)
-        if he:
-            prices["Harga-Emas.org (24K)"] = he
-        else:
-            notes.append("Harga-Emas unavailable")
-
-        spot = await fetch_spot_xau_usd_per_oz(client)
+        # --- SPOT (truth source) ---
+        spot_usd = await fetch_spot_xau_usd_per_oz(client)
         fx = await fetch_usd_idr_rate(client)
-        if spot and fx:
-            prices["Spot (XAU/USD→IDR)"] = xau_usd_oz_to_idr_per_gram(spot, fx)
+
+        spot_idr_g = None
+        if spot_usd and fx:
+            spot_idr_g = xau_usd_oz_to_idr_per_gram(spot_usd, fx)
+            prices["Spot (XAU/USD→IDR)"] = spot_idr_g
         else:
-            # Keep note short; only mention if user expects
             if GOLDAPI_KEY or EXCHANGERATE_API_KEY:
                 notes.append("Spot unavailable (API issue)")
             else:
                 notes.append("Spot disabled (no API keys)")
 
+        # --- Harga-Emas.org (/g spot-like) ---
+        he_spot = await fetch_harga_emas_org_spot_per_gram(client)
+        if he_spot:
+            if spot_idr_g and not within_pct(he_spot, spot_idr_g, 0.02):
+                notes.append("Harga-Emas ignored (outlier vs spot)")
+            else:
+                prices["Harga-Emas.org (/g)"] = he_spot
+        else:
+            notes.append("Harga-Emas unavailable")
+
     cache_set("gold_prices", (prices, notes))
     return prices, notes
+
 
 
 def format_price_message(prices: Dict[str, int], notes: List[str]) -> str:
@@ -228,30 +252,6 @@ def format_price_message(prices: Dict[str, int], notes: List[str]) -> str:
 
     lines.append(f"⏱ {now_wib_str()}")
     return "\n".join(lines)
-
-def within_pct(a: int, b: int, pct: float) -> bool:
-    # pct = 0.02 means 2%
-    if a <= 0 or b <= 0:
-        return False
-    return abs(a - b) / float(b) <= pct
-he_spot = await fetch_harga_emas_org_spot_per_gram(client)
-
-spot_usd = await fetch_spot_xau_usd_per_oz(client)
-fx = await fetch_usd_idr_rate(client)
-
-spot_idr_g = None
-if spot_usd and fx:
-    spot_idr_g = xau_usd_oz_to_idr_per_gram(spot_usd, fx)
-    prices["Spot (XAU/USD→IDR)"] = spot_idr_g
-
-if he_spot:
-    # Validate Harga-Emas against spot if spot is available
-    if spot_idr_g and not within_pct(he_spot, spot_idr_g, 0.02):  # 2% tolerance
-        notes.append("Harga-Emas ignored (outlier vs spot)")
-    else:
-        prices["Harga-Emas.org (/g)"] = he_spot
-else:
-    notes.append("Harga-Emas unavailable")
 
 
 # =========================
@@ -339,7 +339,7 @@ async def receive_webhook(request: Request):
     if not from_number:
         return JSONResponse({"ok": True})
 
-    if cmd in ("emas", "gold", "harga emas", "Emas"):
+    if cmd in ("emas", "gold", "harga emas"):
         prices, notes = await get_gold_prices_idr_per_gram()
         reply = format_price_message(prices, notes)
     elif cmd in ("help", "menu", "?", "hai", "halo", "hi"):
@@ -358,4 +358,5 @@ async def receive_webhook(request: Request):
         print("Reply send error:", repr(e))
 
     return JSONResponse({"ok": True})
+
 
