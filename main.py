@@ -8,7 +8,6 @@ from typing import Dict, Optional, Tuple, List
 
 import pytz
 import httpx
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 
@@ -80,77 +79,6 @@ def rupiah(n: int) -> str:
 # SOURCES
 # =========================
 
-async def fetch_harga_emas_org_spot_per_gram(
-    client: httpx.AsyncClient,
-    spot_idr_g: Optional[int] = None,
-) -> Optional[int]:
-    """
-    Extract harga-emas.org 'Rp ... /g' candidates and choose the one
-    closest to spot_idr_g (truth anchor). If spot_idr_g is None,
-    return the largest /g candidate.
-    """
-    url = "https://harga-emas.org/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://harga-emas.org/",
-    }
-
-    patterns = [
-        r"Rp\s*[\d\.\,]+\s*/\s*g\b",
-        r"Rp\s*[\d\.\,]+\s*/\s*gr\b",
-        r"Rp\s*[\d\.\,]+\s*/\s*gram\b",
-        r"Rp\s*[\d\.\,]+\s*per\s*gram\b",
-    ]
-
-    try:
-        r = await client.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-
-        html = r.text
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(" ", strip=True)
-
-        candidates: List[int] = []
-        raw_hits: List[str] = []
-
-        for hay in (text, html):
-            for p in patterns:
-                for m in re.finditer(p, hay, flags=re.IGNORECASE):
-                    raw = m.group(0)
-                    val = clean_int_from_text(raw)
-                    if val and val > 100_000:
-                        candidates.append(val)
-                        raw_hits.append(raw)
-
-        if not candidates:
-            print("DEBUG harga-emas: no /g candidates found")
-            return None
-
-        # Deduplicate
-        candidates = list(dict.fromkeys(candidates))
-
-        if spot_idr_g:
-            best = min(candidates, key=lambda x: abs(x - spot_idr_g))
-            # Log what we saw (helps confirm)
-            print("DEBUG harga-emas candidates:", candidates[:10], "...")
-            print("DEBUG harga-emas picked:", best, "spot:", spot_idr_g)
-            return best
-
-        # No spot anchor: return max candidate (usually the main headline)
-        best = max(candidates)
-        print("DEBUG harga-emas candidates:", candidates[:10], "...")
-        print("DEBUG harga-emas picked(max):", best)
-        return best
-
-    except Exception as e:
-        print("fetch_harga_emas_org_spot_per_gram error:", repr(e))
-        return None
-
-
-
 
 async def fetch_spot_xau_usd_per_oz(client: httpx.AsyncClient) -> Optional[float]:
     """
@@ -208,7 +136,6 @@ def within_pct(a: int, b: int, pct: float) -> bool:
         return False
     return abs(a - b) / float(b) <= pct
 
-
 async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
     cached = cache_get("gold_prices")
     if cached:
@@ -218,11 +145,9 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
     notes: List[str] = []
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        # --- SPOT (truth source) ---
         spot_usd = await fetch_spot_xau_usd_per_oz(client)
         fx = await fetch_usd_idr_rate(client)
 
-        spot_idr_g = None
         if spot_usd and fx:
             spot_idr_g = xau_usd_oz_to_idr_per_gram(spot_usd, fx)
             prices["Spot (XAU/USD→IDR)"] = spot_idr_g
@@ -232,59 +157,34 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
             else:
                 notes.append("Spot disabled (no API keys)")
 
-        # --- Harga-Emas.org (/g spot-like) ---
-        he = await fetch_harga_emas_org_spot_per_gram(client, spot_idr_g=spot_idr_g)
-        print("DEBUG harga-emas /g parsed:", he)
-
-        if he:
-            if spot_idr_g:
-                diff_pct = (he - spot_idr_g) / spot_idr_g * 100
-                print(f"DEBUG diff_pct Harga-Emas vs Spot: {diff_pct:.3f}%")
-
-            if spot_idr_g and not within_pct(he, spot_idr_g, 0.03):
-                notes.append("Harga-Emas ignored (wrong field / outlier)")
-            else:
-                prices["Harga-Emas.org (/g)"] = he
-        else:
-            notes.append("Harga-Emas unavailable")
-
-
     cache_set("gold_prices", (prices, notes))
     return prices, notes
+
 
 
 
 def format_price_message(prices: Dict[str, int], notes: List[str]) -> str:
     if not prices:
         return (
-            "Maaf, semua sumber harga emas sedang gagal.\n"
+            "Maaf, harga emas sedang tidak tersedia.\n"
             "Coba lagi beberapa menit.\n"
             f"⏱ {now_wib_str()}"
         )
 
-    vals = list(prices.values())
-    median = int(statistics.median(vals))
-    spread = max(vals) - min(vals) if len(vals) >= 2 else 0
-
+    value = next(iter(prices.values()))
     lines = [
-        "💰 Harga Emas (IDR/gram)",
+        "💰 Harga Emas Spot (IDR/gram)",
+        "──────────────",
+        f"{rupiah(value)}",
         "──────────────",
     ]
-    for k, v in prices.items():
-        lines.append(f"{k}: {rupiah(v)}")
 
-    lines.append("──────────────")
-    lines.append(f"📊 Median: {rupiah(median)}")
-    if len(vals) >= 2:
-        lines.append(f"↔️ Perbedaan: {rupiah(spread)}")
-
-    # Keep notes short (max 2)
     if notes:
-        lines.append("")
         lines.append("ℹ️ " + " | ".join(notes[:2]))
 
     lines.append(f"⏱ {now_wib_str()}")
     return "\n".join(lines)
+
 
 
 # =========================
@@ -391,6 +291,7 @@ async def receive_webhook(request: Request):
         print("Reply send error:", repr(e))
 
     return JSONResponse({"ok": True})
+
 
 
 
