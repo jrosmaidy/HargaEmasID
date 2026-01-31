@@ -16,10 +16,10 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 # ENV / CONFIG
 # =========================
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()   # MUST be phone_number_id, not display number
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
 
-# Optional (for spot price)
+# Optional APIs for Spot source
 GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "").strip()
 EXCHANGERATE_API_KEY = os.getenv("EXCHANGERATE_API_KEY", "").strip()
 
@@ -67,7 +67,7 @@ def clean_int_from_text(text: str) -> Optional[int]:
 
 
 def normalize_cmd(s: str) -> str:
-    """Lowercase and normalize whitespace."""
+    """Lowercase and normalize whitespace (handles extra spaces/newlines)."""
     return " ".join((s or "").lower().split())
 
 
@@ -77,51 +77,94 @@ def rupiah(n: int) -> str:
 
 
 # =========================
-# SOURCE FETCHERS
+# SOURCES
 # =========================
-async def fetch_antam_logammulia(client: httpx.AsyncClient) -> Optional[int]:
+async def fetch_pegadaian_sahabat(client: httpx.AsyncClient) -> Optional[int]:
     """
-    Best-effort scrape from LogamMulia.
-    Site HTML changes occasionally; this uses a robust text regex.
+    Pegadaian Sahabat price page.
+    Best-effort scrape (HTML may change; keep as one source among several).
     """
-    url = "https://www.logammulia.com/id/harga-emas-hari-ini"
+    url = "https://sahabat.pegadaian.co.id/harga-emas"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://sahabat.pegadaian.co.id/",
+        "Connection": "keep-alive",
+    }
+
     try:
-        r = await client.get(url, timeout=15)
+        r = await client.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # Robust approach: parse page text and find "Rp ..."
         text = soup.get_text(" ", strip=True)
 
-        # Try to find "1 gr ... Rp ..."
-        m = re.search(r"\b1\s*gr\b.{0,120}?\bRp\s*[\d\.\,]+", text, flags=re.IGNORECASE)
+        # Look for 24K / 24 Karat nearby a Rupiah price
+        m = re.search(
+            r"(24\s*Karat|Emas\s*24\s*Karat|24\s*K)\b.{0,120}?Rp\s*[\d\.\,]+",
+            text,
+            flags=re.IGNORECASE,
+        )
         if not m:
-            return None
+            # Fallback: just find first Rp price on the page (as last resort)
+            m2 = re.search(r"Rp\s*[\d\.\,]+", text)
+            if not m2:
+                return None
+            return clean_int_from_text(m2.group(0))
+
         m2 = re.search(r"Rp\s*[\d\.\,]+", m.group(0))
         if not m2:
             return None
+
         return clean_int_from_text(m2.group(0))
+
     except Exception as e:
-        print("fetch_antam_logammulia error:", repr(e))
+        print("fetch_pegadaian_sahabat error:", repr(e))
         return None
 
 
 async def fetch_harga_emas_org(client: httpx.AsyncClient) -> Optional[int]:
     """
-    Best-effort scrape from harga-emas.org for Emas 24K price.
+    harga-emas.org (Retail reference)
     """
     url = "https://harga-emas.org/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
     try:
-        r = await client.get(url, timeout=15)
+        r = await client.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         text = soup.get_text(" ", strip=True)
 
-        m = re.search(r"Emas\s*24\s*Karat.{0,200}?Rp\s*[\d\.\,]+", text, flags=re.IGNORECASE)
+        # Look for "Emas 24 Karat ... Rp ..."
+        m = re.search(
+            r"Emas\s*24\s*Karat.{0,200}?Rp\s*[\d\.\,]+",
+            text,
+            flags=re.IGNORECASE,
+        )
         if not m:
-            return None
+            # Fallback: first Rp price
+            m2 = re.search(r"Rp\s*[\d\.\,]+", text)
+            if not m2:
+                return None
+            return clean_int_from_text(m2.group(0))
+
         m2 = re.search(r"Rp\s*[\d\.\,]+", m.group(0))
         if not m2:
             return None
+
         return clean_int_from_text(m2.group(0))
+
     except Exception as e:
         print("fetch_harga_emas_org error:", repr(e))
         return None
@@ -129,20 +172,21 @@ async def fetch_harga_emas_org(client: httpx.AsyncClient) -> Optional[int]:
 
 async def fetch_spot_xau_usd_per_oz(client: httpx.AsyncClient) -> Optional[float]:
     """
-    Spot XAU/USD price in USD per troy ounce using GoldAPI (optional).
+    Spot XAU/USD USD per troy ounce using GoldAPI (optional).
+    If no key, returns None.
     """
     if not GOLDAPI_KEY:
         return None
+
     url = "https://www.goldapi.io/api/XAU/USD"
     headers = {"x-access-token": GOLDAPI_KEY}
+
     try:
-        r = await client.get(url, headers=headers, timeout=15)
+        r = await client.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         data = r.json()
         price = data.get("price")
-        if price is None:
-            return None
-        return float(price)
+        return float(price) if price is not None else None
     except Exception as e:
         print("fetch_spot_xau_usd_per_oz error:", repr(e))
         return None
@@ -150,22 +194,20 @@ async def fetch_spot_xau_usd_per_oz(client: httpx.AsyncClient) -> Optional[float
 
 async def fetch_usd_idr_rate(client: httpx.AsyncClient) -> Optional[float]:
     """
-    USD->IDR exchange rate using exchangerate-api.com (optional).
-    Replace this provider if you prefer.
+    USD->IDR using exchangerate-api.com (optional).
+    Replace with your preferred FX provider if needed.
     """
     if not EXCHANGERATE_API_KEY:
         return None
 
     url = f"https://v6.exchangerate-api.com/v6/{EXCHANGERATE_API_KEY}/latest/USD"
     try:
-        r = await client.get(url, timeout=15)
+        r = await client.get(url, timeout=20)
         r.raise_for_status()
         data = r.json()
         rates = data.get("conversion_rates") or {}
         idr = rates.get("IDR")
-        if not idr:
-            return None
-        return float(idr)
+        return float(idr) if idr else None
     except Exception as e:
         print("fetch_usd_idr_rate error:", repr(e))
         return None
@@ -188,11 +230,11 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
     notes: List[str] = []
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        antam = await fetch_antam_logammulia(client)
-        if antam:
-            prices["Antam (LogamMulia)"] = antam
+        peg = await fetch_pegadaian_sahabat(client)
+        if peg:
+            prices["Pegadaian (Sahabat)"] = peg
         else:
-            notes.append("Antam unavailable")
+            notes.append("Pegadaian unavailable")
 
         he = await fetch_harga_emas_org(client)
         if he:
@@ -205,7 +247,7 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
         if spot and fx:
             prices["Spot (XAU/USD→IDR)"] = xau_usd_oz_to_idr_per_gram(spot, fx)
         else:
-            # only note if user expects it
+            # Keep note short; only mention if user expects
             if GOLDAPI_KEY or EXCHANGERATE_API_KEY:
                 notes.append("Spot unavailable (API issue)")
             else:
@@ -227,7 +269,10 @@ def format_price_message(prices: Dict[str, int], notes: List[str]) -> str:
     median = int(statistics.median(vals))
     spread = max(vals) - min(vals) if len(vals) >= 2 else 0
 
-    lines = ["💰 Harga Emas (IDR/gram)", "──────────────"]
+    lines = [
+        "💰 Harga Emas (IDR/gram)",
+        "──────────────",
+    ]
     for k, v in prices.items():
         lines.append(f"{k}: {rupiah(v)}")
 
@@ -236,7 +281,7 @@ def format_price_message(prices: Dict[str, int], notes: List[str]) -> str:
     if len(vals) >= 2:
         lines.append(f"↔️ Spread: {rupiah(spread)}")
 
-    # keep notes short
+    # Keep notes short (max 2)
     if notes:
         lines.append("")
         lines.append("ℹ️ " + " | ".join(notes[:2]))
@@ -249,9 +294,6 @@ def format_price_message(prices: Dict[str, int], notes: List[str]) -> str:
 # WHATSAPP SEND
 # =========================
 async def wa_send_text(to: str, body: str) -> None:
-    """
-    Send a text reply via WhatsApp Cloud API.
-    """
     if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
         print("Missing META_ACCESS_TOKEN or PHONE_NUMBER_ID")
         return
@@ -266,10 +308,9 @@ async def wa_send_text(to: str, body: str) -> None:
     }
 
     async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=headers, json=payload, timeout=15)
+        r = await client.post(url, headers=headers, json=payload, timeout=20)
         print("SEND STATUS:", r.status_code)
-        print("SEND BODY:", r.text[:500])  # truncate
-        # Raise if not ok (so logs show error if any)
+        print("SEND BODY:", r.text[:800])
         r.raise_for_status()
 
 
@@ -284,48 +325,44 @@ async def root():
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     """
-    Meta webhook verification.
+    Meta webhook verification endpoint.
     """
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
-    # Verification request from Meta
     if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
         return PlainTextResponse(challenge)
 
-    # Non-verification GETs (optional)
     return PlainTextResponse("OK", status_code=200)
 
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     """
-    Receive inbound messages and reply.
+    Receive inbound messages and reply with gold price.
     """
     data = await request.json()
-    print("WEBHOOK:", json.dumps(data)[:1000])  # truncate for logs
+    print("WEBHOOK:", json.dumps(data)[:1200])
 
-    # Meta payload: entry -> changes -> value
-    entry = (data.get("entry") or [])
+    entry = data.get("entry") or []
     if not entry:
         return JSONResponse({"ok": True})
 
-    changes = (entry[0].get("changes") or [])
+    changes = entry[0].get("changes") or []
     if not changes:
         return JSONResponse({"ok": True})
 
-    value = (changes[0].get("value") or {})
+    value = changes[0].get("value") or {}
 
-    # Ignore status updates (delivery receipts) — they have no messages
+    # Ignore status-only webhooks
     messages = value.get("messages") or []
     if not messages:
-        # likely statuses event
         return JSONResponse({"ok": True})
 
     msg = messages[0]
-    from_number = msg.get("from")  # digits only, e.g. "62812..."
+    from_number = msg.get("from")  # digits only
     msg_type = msg.get("type")
 
     text_body = ""
@@ -338,8 +375,7 @@ async def receive_webhook(request: Request):
     if not from_number:
         return JSONResponse({"ok": True})
 
-    # Commands
-    if cmd in ("emas", "gold", "harga emas", "price", "antam"):
+    if cmd in ("emas", "gold", "harga emas", "price", "pegadaian"):
         prices, notes = await get_gold_prices_idr_per_gram()
         reply = format_price_message(prices, notes)
     elif cmd in ("help", "menu", "?", "hai", "halo", "hi"):
