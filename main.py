@@ -80,10 +80,14 @@ def rupiah(n: int) -> str:
 # SOURCES
 # =========================
 
-async def fetch_harga_emas_org_spot_per_gram(client: httpx.AsyncClient) -> Optional[int]:
+async def fetch_harga_emas_org_spot_per_gram(
+    client: httpx.AsyncClient,
+    spot_idr_g: Optional[int] = None,
+) -> Optional[int]:
     """
-    Extract the big spot-like number from harga-emas.org.
-    Tries visible text first, then raw HTML, and supports multiple unit formats.
+    Extract harga-emas.org 'Rp ... /g' candidates and choose the one
+    closest to spot_idr_g (truth anchor). If spot_idr_g is None,
+    return the largest /g candidate.
     """
     url = "https://harga-emas.org/"
     headers = {
@@ -92,7 +96,6 @@ async def fetch_harga_emas_org_spot_per_gram(client: httpx.AsyncClient) -> Optio
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": "https://harga-emas.org/",
-
     }
 
     patterns = [
@@ -110,27 +113,42 @@ async def fetch_harga_emas_org_spot_per_gram(client: httpx.AsyncClient) -> Optio
         soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(" ", strip=True)
 
-        # Try visible text first, then raw HTML
+        candidates: List[int] = []
+        raw_hits: List[str] = []
+
         for hay in (text, html):
             for p in patterns:
-                m = re.search(p, hay, flags=re.IGNORECASE)
-                if m:
-                    return clean_int_from_text(m.group(0))
-        # Diagnostics: show whether the server response even contains "/g" or "per gram"
-        if "/g" not in html.lower() and "per gram" not in html.lower() and "/gr" not in html.lower():
-            print("DEBUG harga-emas: no /g text in response (likely JS-rendered or different markup).")
-        else:
-            # show a small snippet around "/g" if present
-            idx = html.lower().find("/g")
-            if idx != -1:
-                snippet = html[max(0, idx-120): idx+120]
-                print("DEBUG harga-emas snippet around /g:", snippet.replace("\n", " ")[:240])
+                for m in re.finditer(p, hay, flags=re.IGNORECASE):
+                    raw = m.group(0)
+                    val = clean_int_from_text(raw)
+                    if val and val > 100_000:
+                        candidates.append(val)
+                        raw_hits.append(raw)
 
-        return None
+        if not candidates:
+            print("DEBUG harga-emas: no /g candidates found")
+            return None
+
+        # Deduplicate
+        candidates = list(dict.fromkeys(candidates))
+
+        if spot_idr_g:
+            best = min(candidates, key=lambda x: abs(x - spot_idr_g))
+            # Log what we saw (helps confirm)
+            print("DEBUG harga-emas candidates:", candidates[:10], "...")
+            print("DEBUG harga-emas picked:", best, "spot:", spot_idr_g)
+            return best
+
+        # No spot anchor: return max candidate (usually the main headline)
+        best = max(candidates)
+        print("DEBUG harga-emas candidates:", candidates[:10], "...")
+        print("DEBUG harga-emas picked(max):", best)
+        return best
 
     except Exception as e:
         print("fetch_harga_emas_org_spot_per_gram error:", repr(e))
         return None
+
 
 
 
@@ -215,7 +233,7 @@ async def get_gold_prices_idr_per_gram() -> Tuple[Dict[str, int], List[str]]:
                 notes.append("Spot disabled (no API keys)")
 
         # --- Harga-Emas.org (/g spot-like) ---
-        he = await fetch_harga_emas_org_spot_per_gram(client)
+        he = await fetch_harga_emas_org_spot_per_gram(client, spot_idr_g=spot_idr_g)
         print("DEBUG harga-emas /g parsed:", he)
 
         if he:
@@ -373,6 +391,7 @@ async def receive_webhook(request: Request):
         print("Reply send error:", repr(e))
 
     return JSONResponse({"ok": True})
+
 
 
 
